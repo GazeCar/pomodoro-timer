@@ -5,7 +5,10 @@ import { Timer } from '@/components/timer';
 import { TaskList } from '@/components/task-list';
 import { Stats } from '@/components/stats';
 import { SettingsModal } from '@/components/settings-modal';
+import { AuthModal } from '@/components/auth-modal';
 import { Task, TimerMode, TimerState, Settings, Stats as StatsType } from '@/types';
+import { supabase } from '@/lib/supabase';
+import { User } from '@supabase/supabase-js';
 
 // デフォルト設定値
 const DEFAULT_SETTINGS: Settings = {
@@ -24,6 +27,7 @@ const DEFAULT_STATS: StatsType = {
 export default function Home() {
   // --- 状態管理 ---
   const [isLoaded, setIsLoaded] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
   const [mode, setMode] = useState<TimerMode>('work');
   const [timerState, setTimerState] = useState<TimerState>('stopped');
   const [remainingSeconds, setRemainingSeconds] = useState(1500); // 25分
@@ -33,26 +37,107 @@ export default function Home() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [stats, setStats] = useState<StatsType>(DEFAULT_STATS);
+  
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isAuthOpen, setIsAuthOpen] = useState(false);
 
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // --- クライアントサイドでのローカルストレージからの復元 ---
+  // --- 1. Supabase 認証状態の監視 ---
   useEffect(() => {
-    const savedSettings = localStorage.getItem('focusflow_settings');
-    if (savedSettings) setSettings(JSON.parse(savedSettings));
+    // 現在のセッションを取得
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+    });
 
-    const savedTasks = localStorage.getItem('focusflow_tasks');
-    if (savedTasks) setTasks(JSON.parse(savedTasks));
+    // 認証状態の変化をリスン
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
 
-    const savedActiveTaskId = localStorage.getItem('focusflow_active_task_id');
-    if (savedActiveTaskId) setActiveTaskId(savedActiveTaskId);
-
-    const savedStats = localStorage.getItem('focusflow_stats');
-    if (savedStats) setStats(JSON.parse(savedStats));
-
-    setIsLoaded(true);
+    return () => {
+      subscription.unsubscribe();
+    };
   }, []);
+
+  // --- 2. ローカルデータの読み込み ＆ クラウド同期の切替 ---
+  useEffect(() => {
+    const loadInitialData = async () => {
+      // 共通設定をロード
+      const savedSettings = localStorage.getItem('focusflow_settings');
+      if (savedSettings) setSettings(JSON.parse(savedSettings));
+
+      if (user) {
+        // ログイン中の場合：Supabase からデータをロード
+        await syncDataFromSupabase(user.id);
+      } else {
+        // ログアウト中の場合：localStorage からデータをロード
+        const savedTasks = localStorage.getItem('focusflow_tasks');
+        if (savedTasks) setTasks(JSON.parse(savedTasks));
+
+        const savedActiveTaskId = localStorage.getItem('focusflow_active_task_id');
+        if (savedActiveTaskId) setActiveTaskId(savedActiveTaskId);
+
+        const savedStats = localStorage.getItem('focusflow_stats');
+        if (savedStats) setStats(JSON.parse(savedStats));
+      }
+      setIsLoaded(true);
+    };
+
+    loadInitialData();
+  }, [user]);
+
+  // --- 3. Supabase からのデータ取得処理 ---
+  const syncDataFromSupabase = async (userId: string) => {
+    try {
+      // タスクの取得
+      const { data: dbTasks, error: tasksError } = await supabase
+        .from('tasks')
+        .select('*')
+        .order('created_at', { ascending: true });
+
+      if (tasksError) throw tasksError;
+
+      // セッション履歴の取得
+      const { data: dbSessions, error: sessionsError } = await supabase
+        .from('focus_sessions')
+        .select('*');
+
+      if (sessionsError) throw sessionsError;
+
+      // ローカル状態へのマッピング
+      const mappedTasks: Task[] = (dbTasks || []).map((t: any) => ({
+        id: t.id,
+        text: t.text,
+        completed: t.completed,
+      }));
+
+      setTasks(mappedTasks);
+
+      // 完了済みタスクカウントとセッションの統計算出
+      const completedSessionsCount = dbSessions?.length || 0;
+      const totalFocusMins = dbSessions?.reduce((sum: number, s: any) => sum + s.duration, 0) || 0;
+      const completedTasksCount = mappedTasks.filter(t => t.completed).length;
+
+      setStats({
+        sessionsCompleted: completedSessionsCount,
+        totalFocusTime: totalFocusMins,
+        completedTasksCount: completedTasksCount,
+      });
+
+      // アクティブタスクの復元
+      const savedActiveTaskId = localStorage.getItem('focusflow_active_task_id');
+      if (savedActiveTaskId && mappedTasks.some(t => t.id === savedActiveTaskId && !t.completed)) {
+        setActiveTaskId(savedActiveTaskId);
+      } else {
+        // アクティブなタスクがなければ最初の未完了タスクを選択
+        const firstActive = mappedTasks.find(t => !t.completed);
+        setActiveTaskId(firstActive ? firstActive.id : null);
+      }
+    } catch (err) {
+      console.error('Supabase同期エラー:', err);
+    }
+  };
 
   // --- テーマカラーの動的切り替え効果 ---
   useEffect(() => {
@@ -96,7 +181,8 @@ export default function Home() {
         setRemainingSeconds((prev) => {
           if (prev <= 1) {
             clearInterval(intervalRef.current!);
-            handleTimerExpiry();
+            // タイマー終了処理はステートアップデートの外側で行う必要がある
+            setTimeout(handleTimerExpiry, 0);
             return 0;
           }
           return prev - 1;
@@ -159,30 +245,46 @@ export default function Home() {
   };
 
   // --- タイマー終了時の処理 ---
-  const handleTimerExpiry = () => {
+  const handleTimerExpiry = async () => {
     setTimerState('stopped');
     playNotificationSound(settings.volume);
 
-    let completedSessions = stats.sessionsCompleted;
-    let focusTime = stats.totalFocusTime;
-
     // 統計情報の更新 (作業完了時のみ)
     if (mode === 'work') {
-      completedSessions += 1;
-      focusTime += settings.workDuration;
-      const updatedStats = {
-        ...stats,
-        sessionsCompleted: completedSessions,
-        totalFocusTime: focusTime,
-      };
-      setStats(updatedStats);
-      localStorage.setItem('focusflow_stats', JSON.stringify(updatedStats));
+      if (user) {
+        // ログイン中の場合：Supabase にセッションを記録
+        try {
+          const { error } = await supabase.from('focus_sessions').insert({
+            user_id: user.id,
+            duration: settings.workDuration,
+            mode: 'work',
+          });
+          if (error) throw error;
+          await syncDataFromSupabase(user.id);
+        } catch (err) {
+          console.error('セッション書き込みエラー:', err);
+        }
+      } else {
+        // ログアウト中の場合：localStorage を更新
+        const nextSessions = stats.sessionsCompleted + 1;
+        const nextTime = stats.totalFocusTime + settings.workDuration;
+        const updatedStats = {
+          ...stats,
+          sessionsCompleted: nextSessions,
+          totalFocusTime: nextTime,
+        };
+        setStats(updatedStats);
+        localStorage.setItem('focusflow_stats', JSON.stringify(updatedStats));
+      }
     }
 
     // 次のモード決定
     let nextMode: TimerMode = 'work';
     if (mode === 'work') {
-      if (completedSessions > 0 && completedSessions % 4 === 0) {
+      const currentCompleted = user 
+        ? stats.sessionsCompleted + 1 // サーバー同期前の一時加算
+        : stats.sessionsCompleted;
+      if (currentCompleted > 0 && currentCompleted % 4 === 0) {
         nextMode = 'long';
       } else {
         nextMode = 'short';
@@ -221,30 +323,62 @@ export default function Home() {
   };
 
   // タスク追加
-  const handleAddTask = (text: string) => {
-    const newTasks = [
-      ...tasks,
-      {
-        id: Date.now().toString(36) + Math.random().toString(36).substring(2, 7),
-        text,
-        completed: false,
-      },
-    ];
-    setTasks(newTasks);
-    localStorage.setItem('focusflow_tasks', JSON.stringify(newTasks));
+  const handleAddTask = async (text: string) => {
+    if (user) {
+      try {
+        const { data, error } = await supabase.from('tasks').insert({
+          user_id: user.id,
+          text,
+          completed: false,
+        }).select();
 
-    // 最初に追加したタスクなら自動アクティブ
-    if (newTasks.length === 1) {
-      setActiveTaskId(newTasks[0].id);
-      localStorage.setItem('focusflow_active_task_id', newTasks[0].id);
+        if (error) throw error;
+        if (data && data.length > 0) {
+          const newTask: Task = { id: data[0].id, text: data[0].text, completed: data[0].completed };
+          setTasks((prev) => [...prev, newTask]);
+          
+          if (tasks.length === 0) {
+            setActiveTaskId(newTask.id);
+            localStorage.setItem('focusflow_active_task_id', newTask.id);
+          }
+        }
+      } catch (err) {
+        console.error('タスク追加エラー:', err);
+      }
+    } else {
+      const newTasks = [
+        ...tasks,
+        {
+          id: Date.now().toString(36) + Math.random().toString(36).substring(2, 7),
+          text,
+          completed: false,
+        },
+      ];
+      setTasks(newTasks);
+      localStorage.setItem('focusflow_tasks', JSON.stringify(newTasks));
+
+      if (newTasks.length === 1) {
+        setActiveTaskId(newTasks[0].id);
+        localStorage.setItem('focusflow_active_task_id', newTasks[0].id);
+      }
     }
   };
 
   // タスク削除
-  const handleDeleteTask = (id: string) => {
-    const newTasks = tasks.filter((t) => t.id !== id);
-    setTasks(newTasks);
-    localStorage.setItem('focusflow_tasks', JSON.stringify(newTasks));
+  const handleDeleteTask = async (id: string) => {
+    if (user) {
+      try {
+        const { error } = await supabase.from('tasks').delete().eq('id', id);
+        if (error) throw error;
+        setTasks((prev) => prev.filter((t) => t.id !== id));
+      } catch (err) {
+        console.error('タスク削除エラー:', err);
+      }
+    } else {
+      const newTasks = tasks.filter((t) => t.id !== id);
+      setTasks(newTasks);
+      localStorage.setItem('focusflow_tasks', JSON.stringify(newTasks));
+    }
 
     if (activeTaskId === id) {
       setActiveTaskId(null);
@@ -253,32 +387,51 @@ export default function Home() {
   };
 
   // タスク完了切り替え
-  const handleToggleTask = (id: string) => {
-    let completedCount = stats.completedTasksCount;
+  const handleToggleTask = async (id: string) => {
+    const task = tasks.find((t) => t.id === id);
+    if (!task) return;
+    const nextCompleted = !task.completed;
 
-    const newTasks = tasks.map((t) => {
-      if (t.id === id) {
-        const nextCompleted = !t.completed;
-        if (nextCompleted) {
-          completedCount += 1;
-        } else {
-          completedCount = Math.max(0, completedCount - 1);
-        }
-        return { ...t, completed: nextCompleted };
+    if (user) {
+      try {
+        const { error } = await supabase
+          .from('tasks')
+          .update({ completed: nextCompleted })
+          .eq('id', id);
+        if (error) throw error;
+        
+        // 画面の状態を更新
+        setTasks((prev) => prev.map((t) => t.id === id ? { ...t, completed: nextCompleted } : t));
+        setStats((prev) => ({
+          ...prev,
+          completedTasksCount: prev.completedTasksCount + (nextCompleted ? 1 : -1),
+        }));
+      } catch (err) {
+        console.error('タスク更新エラー:', err);
       }
-      return t;
-    });
+    } else {
+      let completedCount = stats.completedTasksCount;
+      const newTasks = tasks.map((t) => {
+        if (t.id === id) {
+          if (nextCompleted) {
+            completedCount += 1;
+          } else {
+            completedCount = Math.max(0, completedCount - 1);
+          }
+          return { ...t, completed: nextCompleted };
+        }
+        return t;
+      });
 
-    setTasks(newTasks);
-    localStorage.setItem('focusflow_tasks', JSON.stringify(newTasks));
+      setTasks(newTasks);
+      localStorage.setItem('focusflow_tasks', JSON.stringify(newTasks));
 
-    const updatedStats = { ...stats, completedTasksCount: completedCount };
-    setStats(updatedStats);
-    localStorage.setItem('focusflow_stats', JSON.stringify(updatedStats));
+      const updatedStats = { ...stats, completedTasksCount: completedCount };
+      setStats(updatedStats);
+      localStorage.setItem('focusflow_stats', JSON.stringify(updatedStats));
+    }
 
-    // もし完了したタスクが現在アクティブだった場合、アクティブ解除
-    const completedTask = newTasks.find((t) => t.id === id);
-    if (completedTask?.completed && activeTaskId === id) {
+    if (nextCompleted && activeTaskId === id) {
       setActiveTaskId(null);
       localStorage.setItem('focusflow_active_task_id', '');
     }
@@ -298,11 +451,34 @@ export default function Home() {
   };
 
   // 統計リセット
-  const handleResetStats = () => {
+  const handleResetStats = async () => {
     if (confirm('すべての今日のフォーカス統計データをリセットしますか？この操作は取り消せません。')) {
+      if (user) {
+        try {
+          const { error } = await supabase.from('focus_sessions').delete().eq('user_id', user.id);
+          if (error) throw error;
+          await syncDataFromSupabase(user.id);
+          alert('統計データをリセットしました。');
+        } catch (err) {
+          console.error('統計データリセットエラー:', err);
+        }
+      } else {
+        setStats(DEFAULT_STATS);
+        localStorage.setItem('focusflow_stats', JSON.stringify(DEFAULT_STATS));
+        alert('統計データをリセットしました。');
+      }
+    }
+  };
+
+  // ログアウト処理
+  const handleLogout = async () => {
+    if (confirm('ログアウトしますか？')) {
+      const { error } = await supabase.auth.signOut();
+      if (error) console.error('ログアウトエラー:', error);
+      // ローカルデータをリセット（localStorage はそのまま維持）
+      setTasks([]);
+      setActiveTaskId(null);
       setStats(DEFAULT_STATS);
-      localStorage.setItem('focusflow_stats', JSON.stringify(DEFAULT_STATS));
-      alert('統計データをリセットしました。');
     }
   };
 
@@ -338,16 +514,43 @@ export default function Home() {
             FocusFlow
           </h1>
         </div>
-        <button
-          onClick={() => setIsSettingsOpen(true)}
-          className="icon-btn w-11 h-11 bg-white/[0.03] border border-glass-border hover:bg-white/[0.08] hover:text-white hover:border-glass-border-focus hover:rotate-15 flex items-center justify-center rounded-xl cursor-pointer text-text-secondary transition duration-300"
-          title="設定"
-        >
-          <svg className="w-5 h-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-          </svg>
-        </button>
+        
+        {/* クラウド同期・認証コントロール */}
+        <div className="flex items-center gap-4">
+          {user ? (
+            <div className="flex items-center gap-3 bg-white/[0.03] border border-glass-border px-4 py-1.5 rounded-xl text-xs text-text-secondary select-none">
+              <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+              <span className="truncate max-w-[120px]" title={user.email}>{user.email}</span>
+              <button
+                onClick={handleLogout}
+                className="text-theme hover:underline border-none bg-transparent cursor-pointer font-medium"
+              >
+                ログアウト
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setIsAuthOpen(true)}
+              className="bg-theme/15 hover:bg-theme/25 text-theme text-xs font-semibold px-4 py-2.5 rounded-xl border border-theme/30 transition duration-300 flex items-center gap-1.5 cursor-pointer"
+            >
+              <svg className="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
+              </svg>
+              クラウド同期
+            </button>
+          )}
+
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="icon-btn w-11 h-11 bg-white/[0.03] border border-glass-border hover:bg-white/[0.08] hover:text-white hover:border-glass-border-focus hover:rotate-15 flex items-center justify-center rounded-xl cursor-pointer text-text-secondary transition duration-300"
+            title="設定"
+          >
+            <svg className="w-5 h-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+        </div>
       </header>
 
       {/* メインコンテンツ */}
@@ -389,7 +592,7 @@ export default function Home() {
 
       {/* フッター */}
       <footer className="app-footer text-center py-6 text-xs text-[#64748b] w-full mt-auto">
-        <p>FocusFlow &copy; 2026 - Antigravity 開発サンプル (Next.js)</p>
+        <p>FocusFlow &copy; 2026 - Antigravity 開発サンプル (Next.js + Supabase)</p>
       </footer>
 
       {/* 設定モーダル */}
@@ -400,6 +603,19 @@ export default function Home() {
         onSaveSettings={handleSaveSettings}
         onResetStats={handleResetStats}
         onPlayTestSound={playNotificationSound}
+      />
+
+      {/* 認証モーダル */}
+      <AuthModal
+        isOpen={isAuthOpen}
+        onClose={() => setIsAuthOpen(false)}
+        onSuccess={async () => {
+          // ログイン成功時に同期を実行
+          const { data: { user } } = await supabase.auth.getUser();
+          if (user) {
+            setIsAuthOpen(false);
+          }
+        }}
       />
     </div>
   );
