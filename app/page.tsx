@@ -43,14 +43,21 @@ export default function Home() {
 
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
+  // --- WebSocket 同期用 Refs (最新のステート値をリスナー内で参照するため) ---
+  const timerStateRef = useRef(timerState);
+  const modeRef = useRef(mode);
+  const remainingSecondsRef = useRef(remainingSeconds);
+
+  useEffect(() => { timerStateRef.current = timerState; }, [timerState]);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { remainingSecondsRef.current = remainingSeconds; }, [remainingSeconds]);
+
   // --- 1. Supabase 認証状態の監視 ---
   useEffect(() => {
-    // 現在のセッションを取得
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUser(session?.user ?? null);
     });
 
-    // 認証状態の変化をリスン
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null);
     });
@@ -60,18 +67,16 @@ export default function Home() {
     };
   }, []);
 
-  // --- 2. ローカルデータの読み込み ＆ クラウド同期の切替 ---
+  // --- 2. 初期データロード ＆ 同期 ---
   useEffect(() => {
     const loadInitialData = async () => {
-      // 共通設定をロード
       const savedSettings = localStorage.getItem('focusflow_settings');
       if (savedSettings) setSettings(JSON.parse(savedSettings));
 
       if (user) {
-        // ログイン中の場合：Supabase からデータをロード
         await syncDataFromSupabase(user.id);
+        await syncTimerFromSupabase(user.id);
       } else {
-        // ログアウト中の場合：localStorage からデータをロード
         const savedTasks = localStorage.getItem('focusflow_tasks');
         if (savedTasks) setTasks(JSON.parse(savedTasks));
 
@@ -87,10 +92,117 @@ export default function Home() {
     loadInitialData();
   }, [user]);
 
-  // --- 3. Supabase からのデータ取得処理 ---
+  // --- 3. Supabase からのタイマー状態のロード ---
+  const syncTimerFromSupabase = async (userId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from('user_timers')
+        .select('*')
+        .eq('user_id', userId)
+        .single();
+
+      if (error && error.code !== 'PGRST116') throw error; // 存在しない場合(PGRST116)以外はエラー
+
+      if (data) {
+        const remoteState = data.state as TimerState;
+        const remoteMode = data.mode as TimerMode;
+
+        let remoteRemaining = data.remaining_seconds;
+        if (remoteState === 'running' && data.target_end_at) {
+          const msDiff = new Date(data.target_end_at).getTime() - Date.now();
+          remoteRemaining = Math.max(0, Math.floor(msDiff / 1000));
+        }
+
+        setMode(remoteMode);
+        setTimerState(remoteState === 'running' && remoteRemaining <= 0 ? 'stopped' : remoteState);
+        setRemainingSeconds(remoteRemaining);
+      }
+    } catch (err) {
+      console.error('タイマーロードエラー:', err);
+    }
+  };
+
+  // --- 4. Supabase Realtime によるタイマー状態のWebSocket同期 ---
+  useEffect(() => {
+    if (!user) return;
+
+    const handleRemoteTimerSync = (dbTimer: any) => {
+      const localState = timerStateRef.current;
+      const localMode = modeRef.current;
+      const localRemaining = remainingSecondsRef.current;
+
+      const remoteState = dbTimer.state as TimerState;
+      const remoteMode = dbTimer.mode as TimerMode;
+
+      let remoteRemaining = dbTimer.remaining_seconds;
+      if (remoteState === 'running' && dbTimer.target_end_at) {
+        const msDiff = new Date(dbTimer.target_end_at).getTime() - Date.now();
+        remoteRemaining = Math.max(0, Math.floor(msDiff / 1000));
+      }
+
+      // 自分自身の操作による差分でなければ同期する（モード相違、ステート相違、または時間差が3秒以上）
+      const isStateSame = localState === remoteState;
+      const isModeSame = localMode === remoteMode;
+      const isTimeClose = Math.abs(localRemaining - remoteRemaining) <= 3;
+
+      if (isStateSame && isModeSame && isTimeClose) {
+        return; // 同期不要
+      }
+
+      // 同期実行
+      setMode(remoteMode);
+      setTimerState(remoteState === 'running' && remoteRemaining <= 0 ? 'stopped' : remoteState);
+      setRemainingSeconds(remoteRemaining);
+    };
+
+    // チャンネル監視設定
+    const channel = supabase
+      .channel(`timer_sync_${user.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'user_timers',
+          filter: `user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          if (payload.new) {
+            handleRemoteTimerSync(payload.new);
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [user]);
+
+  // --- 5. タイマー状態をDBに書き込む処理 ---
+  const updateDbTimerState = async (newState: TimerState, newMode: TimerMode, newRemainingSeconds: number) => {
+    if (!user) return;
+    try {
+      const targetEndAt = newState === 'running'
+        ? new Date(Date.now() + newRemainingSeconds * 1000).toISOString()
+        : null;
+
+      await supabase.from('user_timers').upsert({
+        user_id: user.id,
+        state: newState,
+        mode: newMode,
+        remaining_seconds: newRemainingSeconds,
+        target_end_at: targetEndAt,
+        updated_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error('DBタイマー状態更新エラー:', err);
+    }
+  };
+
+  // --- 6. タスク・統計データのSupabaseロード ---
   const syncDataFromSupabase = async (userId: string) => {
     try {
-      // タスクの取得
       const { data: dbTasks, error: tasksError } = await supabase
         .from('tasks')
         .select('*')
@@ -98,14 +210,12 @@ export default function Home() {
 
       if (tasksError) throw tasksError;
 
-      // セッション履歴の取得
       const { data: dbSessions, error: sessionsError } = await supabase
         .from('focus_sessions')
         .select('*');
 
       if (sessionsError) throw sessionsError;
 
-      // ローカル状態へのマッピング
       const mappedTasks: Task[] = (dbTasks || []).map((t: any) => ({
         id: t.id,
         text: t.text,
@@ -114,7 +224,6 @@ export default function Home() {
 
       setTasks(mappedTasks);
 
-      // 完了済みタスクカウントとセッションの統計算出
       const completedSessionsCount = dbSessions?.length || 0;
       const totalFocusMins = dbSessions?.reduce((sum: number, s: any) => sum + s.duration, 0) || 0;
       const completedTasksCount = mappedTasks.filter(t => t.completed).length;
@@ -125,12 +234,10 @@ export default function Home() {
         completedTasksCount: completedTasksCount,
       });
 
-      // アクティブタスクの復元
       const savedActiveTaskId = localStorage.getItem('focusflow_active_task_id');
       if (savedActiveTaskId && mappedTasks.some(t => t.id === savedActiveTaskId && !t.completed)) {
         setActiveTaskId(savedActiveTaskId);
       } else {
-        // アクティブなタスクがなければ最初の未完了タスクを選択
         const firstActive = mappedTasks.find(t => !t.completed);
         setActiveTaskId(firstActive ? firstActive.id : null);
       }
@@ -181,7 +288,6 @@ export default function Home() {
         setRemainingSeconds((prev) => {
           if (prev <= 1) {
             clearInterval(intervalRef.current!);
-            // タイマー終了処理はステートアップデートの外側で行う必要がある
             setTimeout(handleTimerExpiry, 0);
             return 0;
           }
@@ -226,7 +332,7 @@ export default function Home() {
       osc1.start(now);
       osc1.stop(now + 0.6);
 
-      // 2音目: 心地よい和音 (G5 - 少し遅らせて発音)
+      // 2音目: 心地よい和音 (G5)
       const delay = 0.15;
       const osc2 = ctx.createOscillator();
       const gain2 = ctx.createGain();
@@ -249,10 +355,12 @@ export default function Home() {
     setTimerState('stopped');
     playNotificationSound(settings.volume);
 
+    // 終了状態を即座にDBに保存
+    await updateDbTimerState('stopped', mode, 0);
+
     // 統計情報の更新 (作業完了時のみ)
     if (mode === 'work') {
       if (user) {
-        // ログイン中の場合：Supabase にセッションを記録
         try {
           const { error } = await supabase.from('focus_sessions').insert({
             user_id: user.id,
@@ -265,7 +373,6 @@ export default function Home() {
           console.error('セッション書き込みエラー:', err);
         }
       } else {
-        // ログアウト中の場合：localStorage を更新
         const nextSessions = stats.sessionsCompleted + 1;
         const nextTime = stats.totalFocusTime + settings.workDuration;
         const updatedStats = {
@@ -282,7 +389,7 @@ export default function Home() {
     let nextMode: TimerMode = 'work';
     if (mode === 'work') {
       const currentCompleted = user 
-        ? stats.sessionsCompleted + 1 // サーバー同期前の一時加算
+        ? stats.sessionsCompleted + 1
         : stats.sessionsCompleted;
       if (currentCompleted > 0 && currentCompleted % 4 === 0) {
         nextMode = 'long';
@@ -300,20 +407,25 @@ export default function Home() {
   };
 
   // --- 各種操作ハンドラー ---
-  const handleStart = () => {
+  const handleStart = async () => {
     setTimerState('running');
+    await updateDbTimerState('running', mode, remainingSeconds);
   };
 
-  const handlePause = () => {
+  const handlePause = async () => {
     setTimerState('paused');
+    await updateDbTimerState('paused', mode, remainingSeconds);
   };
 
-  const handleReset = () => {
+  const handleReset = async () => {
     setTimerState('stopped');
     let durationMins = settings.workDuration;
     if (mode === 'short') durationMins = settings.shortDuration;
     if (mode === 'long') durationMins = settings.longDuration;
-    setRemainingSeconds(durationMins * 60);
+    const durationSecs = durationMins * 60;
+    
+    setRemainingSeconds(durationSecs);
+    await updateDbTimerState('stopped', mode, durationSecs);
   };
 
   const handleSkip = () => {
@@ -400,7 +512,6 @@ export default function Home() {
           .eq('id', id);
         if (error) throw error;
         
-        // 画面の状態を更新
         setTasks((prev) => prev.map((t) => t.id === id ? { ...t, completed: nextCompleted } : t));
         setStats((prev) => ({
           ...prev,
@@ -475,7 +586,6 @@ export default function Home() {
     if (confirm('ログアウトしますか？')) {
       const { error } = await supabase.auth.signOut();
       if (error) console.error('ログアウトエラー:', error);
-      // ローカルデータをリセット（localStorage はそのまま維持）
       setTasks([]);
       setActiveTaskId(null);
       setStats(DEFAULT_STATS);
@@ -558,9 +668,14 @@ export default function Home() {
         {/* タイマー表示コラム */}
         <Timer
           mode={mode}
-          setMode={(m) => {
+          setMode={async (m) => {
             setMode(m);
             setTimerState('stopped');
+            // モード切替時にDB側のタイマーも停止状態で保存
+            let durationMins = settings.workDuration;
+            if (m === 'short') durationMins = settings.shortDuration;
+            if (m === 'long') durationMins = settings.longDuration;
+            await updateDbTimerState('stopped', m, durationMins * 60);
           }}
           remainingSeconds={remainingSeconds}
           totalDuration={totalDuration}
@@ -610,9 +725,8 @@ export default function Home() {
         isOpen={isAuthOpen}
         onClose={() => setIsAuthOpen(false)}
         onSuccess={async () => {
-          // ログイン成功時に同期を実行
-          const { data: { user } } = await supabase.auth.getUser();
-          if (user) {
+          const { data: { user: loggedInUser } } = await supabase.auth.getUser();
+          if (loggedInUser) {
             setIsAuthOpen(false);
           }
         }}
