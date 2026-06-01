@@ -48,36 +48,47 @@ export const Timer: React.FC<TimerProps> = ({
     }
   };
 
+  const isTabDisabled = state !== 'stopped';
+
   return (
     <section className="timer-section glass-panel flex flex-col items-center justify-between text-center p-8 rounded-[24px] min-h-[480px]">
       {/* モード切替タブ */}
       <div className="mode-tabs flex bg-black/20 p-1.5 rounded-[30px] border border-glass-border gap-1 mb-6">
         <button
-          onClick={() => setMode('work')}
-          className={`tab-btn px-5 py-2 rounded-[20px] text-sm font-medium transition duration-300 cursor-pointer ${
+          onClick={() => !isTabDisabled && setMode('work')}
+          disabled={isTabDisabled}
+          className={`tab-btn px-5 py-2 rounded-[20px] text-sm font-medium transition duration-300 ${
+            isTabDisabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'
+          } ${
             mode === 'work'
               ? 'bg-theme/15 text-theme font-semibold shadow-[inset_0_0_10px_rgba(var(--theme-color-rgb),0.1)]'
-              : 'text-text-secondary hover:text-text-primary'
+              : isTabDisabled ? 'text-text-secondary' : 'text-text-secondary hover:text-text-primary'
           }`}
         >
           作業
         </button>
         <button
-          onClick={() => setMode('short')}
-          className={`tab-btn px-5 py-2 rounded-[20px] text-sm font-medium transition duration-300 cursor-pointer ${
+          onClick={() => !isTabDisabled && setMode('short')}
+          disabled={isTabDisabled}
+          className={`tab-btn px-5 py-2 rounded-[20px] text-sm font-medium transition duration-300 ${
+            isTabDisabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'
+          } ${
             mode === 'short'
               ? 'bg-theme/15 text-theme font-semibold shadow-[inset_0_0_10px_rgba(var(--theme-color-rgb),0.1)]'
-              : 'text-text-secondary hover:text-text-primary'
+              : isTabDisabled ? 'text-text-secondary' : 'text-text-secondary hover:text-text-primary'
           }`}
         >
           短い休憩
         </button>
         <button
-          onClick={() => setMode('long')}
-          className={`tab-btn px-5 py-2 rounded-[20px] text-sm font-medium transition duration-300 cursor-pointer ${
+          onClick={() => !isTabDisabled && setMode('long')}
+          disabled={isTabDisabled}
+          className={`tab-btn px-5 py-2 rounded-[20px] text-sm font-medium transition duration-300 ${
+            isTabDisabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'
+          } ${
             mode === 'long'
               ? 'bg-theme/15 text-theme font-semibold shadow-[inset_0_0_10px_rgba(var(--theme-color-rgb),0.1)]'
-              : 'text-text-secondary hover:text-text-primary'
+              : isTabDisabled ? 'text-text-secondary' : 'text-text-secondary hover:text-text-primary'
           }`}
         >
           長い休憩
@@ -106,7 +117,7 @@ export const Timer: React.FC<TimerProps> = ({
             {formatTime(remainingSeconds)}
           </span>
           <span className="mode-label text-[13px] font-semibold tracking-[2px] uppercase text-theme mt-2 transition duration-300">
-            {getModeLabel(mode)}
+            {state === 'paused' ? '一時停止' : getModeLabel(mode)}
           </span>
         </div>
       </div>
