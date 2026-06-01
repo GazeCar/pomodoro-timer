@@ -13,7 +13,7 @@ const outfit = Outfit({
 });
 
 export const metadata: Metadata = {
-  title: 'FocusFlow - プレミアム・ポモドーロタイマー',
+  title: 'Pomodoro Timer Δ - プレミアム・ポモドーロタイマー',
   description: 'グラスモーフィズムデザインの高性能なポモドーロタイマーアプリケーション。',
 };
 

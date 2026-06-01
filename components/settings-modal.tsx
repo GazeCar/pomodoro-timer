@@ -23,7 +23,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [workVal, setWorkVal] = useState(settings.workDuration);
   const [shortVal, setShortVal] = useState(settings.shortDuration);
   const [longVal, setLongVal] = useState(settings.longDuration);
-  const [volumeVal, setVolumeVal] = useState(settings.volume);
+  const [longBreakInterval, setLongBreakInterval] = useState(settings.longBreakInterval || 4);
+  const [autoStartWork, setAutoStartWork] = useState(settings.autoStartWork || false);
+  const [autoStartBreak, setAutoStartBreak] = useState(settings.autoStartBreak || false);
+  const [muteNotification, setMuteNotification] = useState(settings.muteNotification || false);
 
   // モーダルが開かれた時にローカル状態を最新に同期
   useEffect(() => {
@@ -31,7 +34,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setWorkVal(settings.workDuration);
       setShortVal(settings.shortDuration);
       setLongVal(settings.longDuration);
-      setVolumeVal(settings.volume);
+      setLongBreakInterval(settings.longBreakInterval || 4);
+      setAutoStartWork(settings.autoStartWork || false);
+      setAutoStartBreak(settings.autoStartBreak || false);
+      setMuteNotification(settings.muteNotification || false);
     }
   }, [isOpen, settings]);
 
@@ -42,7 +48,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       workDuration: Math.max(1, workVal),
       shortDuration: Math.max(1, shortVal),
       longDuration: Math.max(1, longVal),
-      volume: volumeVal,
+      volume: muteNotification ? 0 : 100,
+      longBreakInterval: Math.max(1, longBreakInterval),
+      autoStartWork,
+      autoStartBreak,
+      muteNotification,
     });
     onClose();
   };
@@ -78,7 +88,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         <div className="modal-body flex flex-col gap-6">
           {/* 時間設定 */}
           <div className="settings-group flex flex-col gap-3">
-            <h4 className="text-sm font-semibold text-white tracking-wide">セッション時間（分）</h4>
+            <h4 className="text-sm font-semibold text-white tracking-wide">時間設定（分）</h4>
             <div className="time-inputs-grid grid grid-cols-3 gap-3">
               <div className="input-field flex flex-col gap-1.5">
                 <label className="text-xs text-text-secondary" htmlFor="input-work">作業</label>
@@ -119,28 +129,60 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
-          {/* 通知設定 */}
+          {/* 頻度設定 */}
+          <div className="settings-group flex flex-col gap-1.5">
+            <label className="text-sm font-semibold text-white tracking-wide" htmlFor="input-interval">
+              長時間休憩の頻度（セッション数）
+            </label>
+            <input
+              type="number"
+              id="input-interval"
+              min="1"
+              max="12"
+              value={longBreakInterval}
+              onChange={(e) => setLongBreakInterval(parseInt(e.target.value) || 4)}
+              className="bg-black/25 border border-glass-border rounded-xl p-2.5 text-white text-sm font-semibold outline-none transition duration-300 focus:border-theme max-w-[120px]"
+            />
+          </div>
+
+          {/* 動作オプション */}
           <div className="settings-group flex flex-col gap-3">
-            <h4 className="text-sm font-semibold text-white tracking-wide">通知設定</h4>
-            <div className="sound-control flex flex-col gap-2">
-              <label className="text-[13px] text-text-secondary" htmlFor="input-volume">通知音量</label>
-              <div className="volume-slider-container flex items-center gap-3">
+            <h4 className="text-sm font-semibold text-white tracking-wide">動作オプション</h4>
+            <div className="flex flex-col gap-3">
+              <label className="flex items-center gap-3 text-sm text-text-secondary cursor-pointer select-none">
                 <input
-                  type="range"
-                  id="input-volume"
-                  min="0"
-                  max="100"
-                  value={volumeVal}
-                  onChange={(e) => setVolumeVal(parseInt(e.target.value))}
-                  className="flex-1 accent-theme bg-white/10 rounded-lg h-1.5 outline-none cursor-pointer"
+                  type="checkbox"
+                  checked={autoStartWork}
+                  onChange={(e) => setAutoStartWork(e.target.checked)}
+                  className="appearance-none w-4 h-4 border border-[#64748b] rounded-[4px] outline-none cursor-pointer flex items-center justify-center transition duration-300 checked:bg-theme checked:border-theme checked:after:content-[''] checked:after:w-2 checked:after:h-1 checked:after:border-l-[1.5px] checked:after:border-b-[1.5px] checked:after:border-bg-color checked:after:-rotate-45 checked:after:translate-x-[0.2px] checked:after:-translate-y-[0.2px]"
                 />
-                <span id="volume-value" className="text-[13px] font-medium text-white min-w-9 text-right">
-                  {volumeVal}%
-                </span>
-              </div>
+                次の作業を自動スタート
+              </label>
+              <label className="flex items-center gap-3 text-sm text-text-secondary cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={autoStartBreak}
+                  onChange={(e) => setAutoStartBreak(e.target.checked)}
+                  className="appearance-none w-4 h-4 border border-[#64748b] rounded-[4px] outline-none cursor-pointer flex items-center justify-center transition duration-300 checked:bg-theme checked:border-theme checked:after:content-[''] checked:after:w-2 checked:after:h-1 checked:after:border-l-[1.5px] checked:after:border-b-[1.5px] checked:after:border-bg-color checked:after:-rotate-45 checked:after:translate-x-[0.2px] checked:after:-translate-y-[0.2px]"
+                />
+                次の休憩を自動スタート
+              </label>
+              <label className="flex items-center gap-3 text-sm text-text-secondary cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={muteNotification}
+                  onChange={(e) => setMuteNotification(e.target.checked)}
+                  className="appearance-none w-4 h-4 border border-[#64748b] rounded-[4px] outline-none cursor-pointer flex items-center justify-center transition duration-300 checked:bg-theme checked:border-theme checked:after:content-[''] checked:after:w-2 checked:after:h-1 checked:after:border-l-[1.5px] checked:after:border-b-[1.5px] checked:after:border-bg-color checked:after:-rotate-45 checked:after:translate-x-[0.2px] checked:after:-translate-y-[0.2px]"
+                />
+                通知音をミュート
+              </label>
             </div>
+          </div>
+
+          {/* テスト再生 */}
+          <div className="settings-group flex flex-col gap-3">
             <button
-              onClick={() => onPlayTestSound(volumeVal)}
+              onClick={() => onPlayTestSound(muteNotification ? 0 : 100)}
               className="btn secondary w-full bg-white/[0.03] border border-glass-border text-text-secondary hover:bg-white/[0.07] hover:text-white hover:border-glass-border-focus px-5 py-3 rounded-xl text-sm font-semibold flex items-center justify-center transition duration-300 cursor-pointer"
             >
               <svg className="w-4 h-4 mr-2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -153,7 +195,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
           {/* データ管理 */}
           <div className="settings-group flex flex-col gap-3">
-            <h4 className="text-sm font-semibold text-white tracking-wide">データ管理</h4>
             <button
               onClick={onResetStats}
               className="btn danger w-full bg-danger-color/10 border border-danger-color/20 text-danger-color hover:bg-danger-color hover:text-bg-color hover:shadow-[0_4px_12px_rgba(239,68,68,0.4)] px-5 py-3 rounded-xl text-sm font-semibold flex items-center justify-center transition duration-300 cursor-pointer"

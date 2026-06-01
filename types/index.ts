@@ -11,7 +11,11 @@ export interface Settings {
   workDuration: number;
   shortDuration: number;
   longDuration: number;
-  volume: number;
+  volume: number; // ミュート判定時に 0、解除時に 100 として扱います
+  longBreakInterval: number; // 長時間休憩の頻度
+  autoStartWork: boolean; // 次の作業を自動スタート
+  autoStartBreak: boolean; // 次の休憩を自動スタート
+  muteNotification: boolean; // 通知音をミュート
 }
 
 export interface Stats {
