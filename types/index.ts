@@ -1,12 +1,6 @@
 export type TimerState = 'stopped' | 'running' | 'paused';
 export type TimerMode = 'work' | 'short' | 'long';
 
-export interface Task {
-  id: string;
-  text: string;
-  completed: boolean;
-}
-
 export interface Settings {
   workDuration: number;
   shortDuration: number;
@@ -21,7 +15,7 @@ export interface Settings {
 export interface Stats {
   sessionsCompleted: number;
   totalFocusTime: number;
-  completedTasksCount: number;
+  completedTasksCount: number; // 互換性のため残す、または将来のために残しますが今回は使いません
 }
 
 export interface ModeTheme {

@@ -2,11 +2,10 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Timer } from '@/components/timer';
-import { TaskList } from '@/components/task-list';
 import { Stats } from '@/components/stats';
 import { SettingsModal } from '@/components/settings-modal';
 import { AuthModal } from '@/components/auth-modal';
-import { Task, TimerMode, TimerState, Settings, Stats as StatsType } from '@/types';
+import { TimerMode, TimerState, Settings, Stats as StatsType } from '@/types';
 import { supabase } from '@/lib/supabase';
 import { User } from '@supabase/supabase-js';
 
@@ -22,11 +21,12 @@ const DEFAULT_SETTINGS: Settings = {
   muteNotification: false,
 };
 
-const DEFAULT_STATS: StatsType = {
-  sessionsCompleted: 0,
-  totalFocusTime: 0,
-  completedTasksCount: 0,
-};
+interface FocusSession {
+  id: string;
+  duration: number;
+  mode: string;
+  completedAt: string;
+}
 
 export default function Home() {
   // --- 状態管理 ---
@@ -38,10 +38,8 @@ export default function Home() {
   const [totalDuration, setTotalDuration] = useState(1500);
   
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
-  const [stats, setStats] = useState<StatsType>(DEFAULT_STATS);
-  
+  const [focusSessions, setFocusSessions] = useState<FocusSession[]>([]);
+  const [selectedDate, setSelectedDate] = useState(() => new Date().toLocaleDateString('sv-SE')); // YYYY-MM-DD
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
 
@@ -79,7 +77,6 @@ export default function Home() {
       const savedSettings = localStorage.getItem('focusflow_settings');
       if (savedSettings) {
         const parsed = JSON.parse(savedSettings);
-        // 新しい設定項目の初期値を補完してマージ
         setSettings({
           ...DEFAULT_SETTINGS,
           ...parsed
@@ -90,14 +87,10 @@ export default function Home() {
         await syncDataFromSupabase(user.id);
         await syncTimerFromSupabase(user.id);
       } else {
-        const savedTasks = localStorage.getItem('focusflow_tasks');
-        if (savedTasks) setTasks(JSON.parse(savedTasks));
-
-        const savedActiveTaskId = localStorage.getItem('focusflow_active_task_id');
-        if (savedActiveTaskId) setActiveTaskId(savedActiveTaskId);
-
-        const savedStats = localStorage.getItem('focusflow_stats');
-        if (savedStats) setStats(JSON.parse(savedStats));
+        const savedSessions = localStorage.getItem('focusflow_sessions');
+        if (savedSessions) {
+          setFocusSessions(JSON.parse(savedSessions));
+        }
       }
       setIsLoaded(true);
     };
@@ -210,47 +203,23 @@ export default function Home() {
     }
   };
 
-  // --- 6. タスク・統計データのSupabaseロード ---
+  // --- 6. 統計データのSupabaseロード ---
   const syncDataFromSupabase = async (userId: string) => {
     try {
-      const { data: dbTasks, error: tasksError } = await supabase
-        .from('tasks')
-        .select('*')
-        .order('created_at', { ascending: true });
-
-      if (tasksError) throw tasksError;
-
       const { data: dbSessions, error: sessionsError } = await supabase
         .from('focus_sessions')
         .select('*');
 
       if (sessionsError) throw sessionsError;
 
-      const mappedTasks: Task[] = (dbTasks || []).map((t: any) => ({
-        id: t.id,
-        text: t.text,
-        completed: t.completed,
+      const mappedSessions: FocusSession[] = (dbSessions || []).map((s: any) => ({
+        id: s.id,
+        duration: s.duration,
+        mode: s.mode,
+        completedAt: s.completed_at || s.completedAt,
       }));
 
-      setTasks(mappedTasks);
-
-      const completedSessionsCount = dbSessions?.length || 0;
-      const totalFocusMins = dbSessions?.reduce((sum: number, s: any) => sum + s.duration, 0) || 0;
-      const completedTasksCount = mappedTasks.filter(t => t.completed).length;
-
-      setStats({
-        sessionsCompleted: completedSessionsCount,
-        totalFocusTime: totalFocusMins,
-        completedTasksCount: completedTasksCount,
-      });
-
-      const savedActiveTaskId = localStorage.getItem('focusflow_active_task_id');
-      if (savedActiveTaskId && mappedTasks.some(t => t.id === savedActiveTaskId && !t.completed)) {
-        setActiveTaskId(savedActiveTaskId);
-      } else {
-        const firstActive = mappedTasks.find(t => !t.completed);
-        setActiveTaskId(firstActive ? firstActive.id : null);
-      }
+      setFocusSessions(mappedSessions);
     } catch (err) {
       console.error('Supabase同期エラー:', err);
     }
@@ -319,7 +288,6 @@ export default function Home() {
 
   // --- 音声シンセサイザー (Web Audio API) ---
   const playNotificationSound = (volume: number) => {
-    // ミュート設定がONの場合は鳴らさない
     if (settingsRef.current.muteNotification) return;
 
     const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
@@ -363,21 +331,33 @@ export default function Home() {
     }
   };
 
+  // --- 統計データの集計算出 ---
+  const getFilteredStats = () => {
+    const filtered = focusSessions.filter((session) => {
+      const sessionDateStr = new Date(session.completedAt).toLocaleDateString('sv-SE');
+      return sessionDateStr === selectedDate;
+    });
+
+    const completedCount = filtered.length;
+    const totalDurationMins = filtered.reduce((sum, s) => sum + s.duration, 0);
+
+    return {
+      sessionsCompleted: completedCount,
+      totalFocusTime: totalDurationMins,
+    };
+  };
+
   // --- タイマー終了時の処理 ---
   const handleTimerExpiry = async () => {
-    playNotificationSound(100); // 常にMax音量で再生（ミュートチェックは内部で判定）
+    playNotificationSound(100);
 
-    // 完了数の集計を算出
-    let completedSessions = stats.sessionsCompleted;
-    if (mode === 'work') {
-      completedSessions += 1;
-    }
-
-    // 次のモード決定 (設定値「長時間休憩の頻度」に応じる)
+    // 次のモード決定
     let nextMode: TimerMode = 'work';
     if (mode === 'work') {
       const interval = settingsRef.current.longBreakInterval || 4;
-      if (completedSessions > 0 && completedSessions % interval === 0) {
+      // 今回のセッションを含めて次のモード決定
+      const currentCompleted = getFilteredStats().sessionsCompleted + 1;
+      if (currentCompleted > 0 && currentCompleted % interval === 0) {
         nextMode = 'long';
       } else {
         nextMode = 'short';
@@ -386,7 +366,6 @@ export default function Home() {
       nextMode = 'work';
     }
 
-    // 自動開始（Auto Start）設定の判定
     const isNextWork = nextMode === 'work';
     const shouldAutoStart = isNextWork 
       ? settingsRef.current.autoStartWork 
@@ -394,13 +373,11 @@ export default function Home() {
 
     const nextState = shouldAutoStart ? 'running' : 'stopped';
 
-    // データベースタイマー状態の即時更新
     let durationMins = settingsRef.current.workDuration;
     if (nextMode === 'short') durationMins = settingsRef.current.shortDuration;
     if (nextMode === 'long') durationMins = settingsRef.current.longDuration;
     const nextSeconds = durationMins * 60;
 
-    // ローカルステートを先に変更してループ処理
     setMode(nextMode);
     setTimerState(nextState);
     setRemainingSeconds(nextSeconds);
@@ -411,25 +388,35 @@ export default function Home() {
     if (mode === 'work') {
       if (user) {
         try {
-          const { error } = await supabase.from('focus_sessions').insert({
+          const { data, error } = await supabase.from('focus_sessions').insert({
             user_id: user.id,
             duration: settingsRef.current.workDuration,
             mode: 'work',
-          });
+          }).select();
+
           if (error) throw error;
-          await syncDataFromSupabase(user.id);
+          if (data && data.length > 0) {
+            const newSession = {
+              id: data[0].id,
+              duration: data[0].duration,
+              mode: data[0].mode,
+              completedAt: data[0].completed_at,
+            };
+            setFocusSessions((prev) => [...prev, newSession]);
+          }
         } catch (err) {
           console.error('セッション書き込みエラー:', err);
         }
       } else {
-        const nextTime = stats.totalFocusTime + settingsRef.current.workDuration;
-        const updatedStats = {
-          ...stats,
-          sessionsCompleted: completedSessions,
-          totalFocusTime: nextTime,
+        const newSession = {
+          id: Date.now().toString(36) + Math.random().toString(36).substring(2, 7),
+          duration: settingsRef.current.workDuration,
+          mode: 'work',
+          completedAt: new Date().toISOString(),
         };
-        setStats(updatedStats);
-        localStorage.setItem('focusflow_stats', JSON.stringify(updatedStats));
+        const nextSessions = [...focusSessions, newSession];
+        setFocusSessions(nextSessions);
+        localStorage.setItem('focusflow_sessions', JSON.stringify(nextSessions));
       }
     }
 
@@ -466,127 +453,6 @@ export default function Home() {
     }
   };
 
-  // タスク追加
-  const handleAddTask = async (text: string) => {
-    if (user) {
-      try {
-        const { data, error } = await supabase.from('tasks').insert({
-          user_id: user.id,
-          text,
-          completed: false,
-        }).select();
-
-        if (error) throw error;
-        if (data && data.length > 0) {
-          const newTask: Task = { id: data[0].id, text: data[0].text, completed: data[0].completed };
-          setTasks((prev) => [...prev, newTask]);
-          
-          if (tasks.length === 0) {
-            setActiveTaskId(newTask.id);
-            localStorage.setItem('focusflow_active_task_id', newTask.id);
-          }
-        }
-      } catch (err) {
-        console.error('タスク追加エラー:', err);
-      }
-    } else {
-      const newTasks = [
-        ...tasks,
-        {
-          id: Date.now().toString(36) + Math.random().toString(36).substring(2, 7),
-          text,
-          completed: false,
-        },
-      ];
-      setTasks(newTasks);
-      localStorage.setItem('focusflow_tasks', JSON.stringify(newTasks));
-
-      if (newTasks.length === 1) {
-        setActiveTaskId(newTasks[0].id);
-        localStorage.setItem('focusflow_active_task_id', newTasks[0].id);
-      }
-    }
-  };
-
-  // タスク削除
-  const handleDeleteTask = async (id: string) => {
-    if (user) {
-      try {
-        const { error } = await supabase.from('tasks').delete().eq('id', id);
-        if (error) throw error;
-        setTasks((prev) => prev.filter((t) => t.id !== id));
-      } catch (err) {
-        console.error('タスク削除エラー:', err);
-      }
-    } else {
-      const newTasks = tasks.filter((t) => t.id !== id);
-      setTasks(newTasks);
-      localStorage.setItem('focusflow_tasks', JSON.stringify(newTasks));
-    }
-
-    if (activeTaskId === id) {
-      setActiveTaskId(null);
-      localStorage.setItem('focusflow_active_task_id', '');
-    }
-  };
-
-  // タスク完了切り替え
-  const handleToggleTask = async (id: string) => {
-    const task = tasks.find((t) => t.id === id);
-    if (!task) return;
-    const nextCompleted = !task.completed;
-
-    if (user) {
-      try {
-        const { error } = await supabase
-          .from('tasks')
-          .update({ completed: nextCompleted })
-          .eq('id', id);
-        if (error) throw error;
-        
-        setTasks((prev) => prev.map((t) => t.id === id ? { ...t, completed: nextCompleted } : t));
-        setStats((prev) => ({
-          ...prev,
-          completedTasksCount: prev.completedTasksCount + (nextCompleted ? 1 : -1),
-        }));
-      } catch (err) {
-        console.error('タスク更新エラー:', err);
-      }
-    } else {
-      let completedCount = stats.completedTasksCount;
-      const newTasks = tasks.map((t) => {
-        if (t.id === id) {
-          if (nextCompleted) {
-            completedCount += 1;
-          } else {
-            completedCount = Math.max(0, completedCount - 1);
-          }
-          return { ...t, completed: nextCompleted };
-        }
-        return t;
-      });
-
-      setTasks(newTasks);
-      localStorage.setItem('focusflow_tasks', JSON.stringify(newTasks));
-
-      const updatedStats = { ...stats, completedTasksCount: completedCount };
-      setStats(updatedStats);
-      localStorage.setItem('focusflow_stats', JSON.stringify(updatedStats));
-    }
-
-    if (nextCompleted && activeTaskId === id) {
-      setActiveTaskId(null);
-      localStorage.setItem('focusflow_active_task_id', '');
-    }
-  };
-
-  // アクティブタスク選択
-  const handleSelectTask = (id: string) => {
-    const nextId = activeTaskId === id ? null : id;
-    setActiveTaskId(nextId);
-    localStorage.setItem('focusflow_active_task_id', nextId || '');
-  };
-
   // 設定の保存
   const handleSaveSettings = (newSettings: Settings) => {
     setSettings(newSettings);
@@ -600,14 +466,14 @@ export default function Home() {
         try {
           const { error } = await supabase.from('focus_sessions').delete().eq('user_id', user.id);
           if (error) throw error;
-          await syncDataFromSupabase(user.id);
+          setFocusSessions([]);
           alert('統計データをリセットしました。');
         } catch (err) {
           console.error('統計データリセットエラー:', err);
         }
       } else {
-        setStats(DEFAULT_STATS);
-        localStorage.setItem('focusflow_stats', JSON.stringify(DEFAULT_STATS));
+        setFocusSessions([]);
+        localStorage.setItem('focusflow_sessions', JSON.stringify([]));
         alert('統計データをリセットしました。');
       }
     }
@@ -618,9 +484,8 @@ export default function Home() {
     if (confirm('ログアウトしますか？')) {
       const { error } = await supabase.auth.signOut();
       if (error) console.error('ログアウトエラー:', error);
-      setTasks([]);
-      setActiveTaskId(null);
-      setStats(DEFAULT_STATS);
+      setFocusSessions([]);
+      setTimerState('stopped');
     }
   };
 
@@ -633,8 +498,7 @@ export default function Home() {
     );
   }
 
-  const activeTask = tasks.find((t) => t.id === activeTaskId);
-  const activeTaskName = activeTask && !activeTask.completed ? activeTask.text : null;
+  const filteredStats = getFilteredStats();
 
   return (
     <div className="app-container w-full max-w-[1100px] px-4 sm:px-6 py-6 flex flex-col gap-6 flex-1 mx-auto overflow-hidden">
@@ -715,23 +579,15 @@ export default function Home() {
           onPause={handlePause}
           onReset={handleReset}
           onSkip={handleSkip}
-          activeTaskName={activeTaskName}
         />
 
-        {/* タスク・統計コラム */}
+        {/* 統計コラム (タスク管理は削除されました) */}
         <div className="sidebar-section flex flex-col gap-6">
-          <TaskList
-            tasks={tasks}
-            activeTaskId={activeTaskId}
-            onAddTask={handleAddTask}
-            onDeleteTask={handleDeleteTask}
-            onToggleTask={handleToggleTask}
-            onSelectTask={handleSelectTask}
-          />
           <Stats
-            sessionsCompleted={stats.sessionsCompleted}
-            totalFocusTime={stats.totalFocusTime}
-            completedTasksCount={stats.completedTasksCount}
+            sessionsCompleted={filteredStats.sessionsCompleted}
+            totalFocusTime={filteredStats.totalFocusTime}
+            selectedDate={selectedDate}
+            onDateChange={setSelectedDate}
           />
         </div>
       </main>

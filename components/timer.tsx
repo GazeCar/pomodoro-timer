@@ -13,7 +13,6 @@ interface TimerProps {
   onPause: () => void;
   onReset: () => void;
   onSkip: () => void;
-  activeTaskName: string | null;
 }
 
 export const Timer: React.FC<TimerProps> = ({
@@ -26,7 +25,6 @@ export const Timer: React.FC<TimerProps> = ({
   onPause,
   onReset,
   onSkip,
-  activeTaskName,
 }) => {
   const radius = 95;
   const circumference = radius * 2 * Math.PI;
@@ -93,7 +91,7 @@ export const Timer: React.FC<TimerProps> = ({
           <circle className="progress-ring__background fill-transparent stroke-white/[0.03] stroke-[7]" cx="110" cy="110" r={radius} />
           {/* 進捗サークル */}
           <circle
-            className="progress-ring__circle progress-ring__circle fill-transparent stroke-theme stroke-[8] stroke-linecap-round filter drop-shadow-[0_0_6px_rgba(var(--theme-color-rgb),0.6)]"
+            className="progress-ring__circle fill-transparent stroke-theme stroke-[8] stroke-linecap-round filter drop-shadow-[0_0_6px_rgba(var(--theme-color-rgb),0.6)]"
             cx="110"
             cy="110"
             r={radius}
@@ -113,16 +111,8 @@ export const Timer: React.FC<TimerProps> = ({
         </div>
       </div>
 
-      {/* アクティブなタスク表示 */}
-      <div className="active-task-container my-4 px-6 py-3 bg-black/15 rounded-[16px] border-l-3 border-theme max-w-[80%] w-full transition duration-300 text-left">
-        <p className="text-[11px] text-[#64748b] uppercase tracking-wider mb-1">現在のフォーカス先</p>
-        <p className={`text-sm font-medium truncate ${!activeTaskName ? 'text-[#64748b] italic' : 'text-white'}`}>
-          {activeTaskName || 'タスクが選択されていません'}
-        </p>
-      </div>
-
       {/* 操作コントロール */}
-      <div className="timer-controls flex items-center gap-5">
+      <div className="timer-controls flex items-center gap-5 mt-4">
         <button
           onClick={onReset}
           className="control-btn secondary w-12 h-12 rounded-full border border-glass-border bg-white/[0.03] text-text-secondary hover:bg-white/[0.08] hover:text-white hover:border-glass-border-focus flex items-center justify-center transition duration-300 cursor-pointer"
