@@ -10,6 +10,7 @@ interface SettingsModalProps {
   onSaveSettings: (settings: Settings) => void;
   onResetStats: () => void;
   onPlayTestSound: (volume: number) => void;
+  onGenerateTestData?: () => void;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -19,6 +20,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSaveSettings,
   onResetStats,
   onPlayTestSound,
+  onGenerateTestData,
 }) => {
   const [workVal, setWorkVal] = useState(settings.workDuration);
   const [shortVal, setShortVal] = useState(settings.shortDuration);
@@ -204,6 +206,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </svg>
               統計データをリセット
             </button>
+
+            {onGenerateTestData && (
+              <button
+                onClick={onGenerateTestData}
+                className="btn secondary w-full bg-theme/10 border border-theme/20 text-theme hover:bg-theme hover:text-bg-color px-5 py-3 rounded-xl text-sm font-semibold flex items-center justify-center transition duration-300 cursor-pointer"
+              >
+                <svg className="w-4 h-4 mr-2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
+                </svg>
+                ダミー統計データを生成 (7日分)
+              </button>
+            )}
           </div>
         </div>
 

@@ -45,6 +45,10 @@ export default function Home() {
 
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
+  // --- デバイス一意IDとオーナーシップ状態 ---
+  const deviceIdRef = useRef('');
+  const [isOwner, setIsOwner] = useState(true);
+
   // --- WebSocket 同期用 Refs (最新のステート値をリスナー内で参照するため) ---
   const timerStateRef = useRef(timerState);
   const modeRef = useRef(mode);
@@ -55,6 +59,21 @@ export default function Home() {
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { remainingSecondsRef.current = remainingSeconds; }, [remainingSeconds]);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+  // デバイスIDの初期化
+  useEffect(() => {
+    deviceIdRef.current = 'device_' + Math.random().toString(36).substring(2, 11);
+  }, []);
+
+  // オーナーシップ状態の算出
+  useEffect(() => {
+    if (user) {
+      // settings 内の ownerDeviceId が存在し、自分と一致する場合のみオーナー
+      setIsOwner(settings.ownerDeviceId === deviceIdRef.current);
+    } else {
+      setIsOwner(true); // 未ログイン時は常にオーナー
+    }
+  }, [settings.ownerDeviceId, user]);
 
   // --- 1. Supabase 認証状態の監視 ---
   useEffect(() => {
@@ -75,17 +94,19 @@ export default function Home() {
   useEffect(() => {
     const loadInitialData = async () => {
       const savedSettings = localStorage.getItem('focusflow_settings');
+      let localSettings = DEFAULT_SETTINGS;
       if (savedSettings) {
         const parsed = JSON.parse(savedSettings);
-        setSettings({
+        localSettings = {
           ...DEFAULT_SETTINGS,
           ...parsed
-        });
+        };
+        setSettings(localSettings);
       }
 
       if (user) {
         await syncDataFromSupabase(user.id);
-        await syncTimerFromSupabase(user.id);
+        await syncTimerFromSupabase(user.id, localSettings);
       } else {
         const savedSessions = localStorage.getItem('focusflow_sessions');
         if (savedSessions) {
@@ -99,7 +120,7 @@ export default function Home() {
   }, [user]);
 
   // --- 3. Supabase からのタイマー状態のロード ---
-  const syncTimerFromSupabase = async (userId: string) => {
+  const syncTimerFromSupabase = async (userId: string, currentSettings: Settings) => {
     try {
       const { data, error } = await supabase
         .from('user_timers')
@@ -110,8 +131,80 @@ export default function Home() {
       if (error && error.code !== 'PGRST116') throw error;
 
       if (data) {
+        // DBから設定も同期
+        let activeSettings = currentSettings;
+        if (data.settings) {
+          activeSettings = {
+            ...DEFAULT_SETTINGS,
+            ...data.settings,
+          };
+          setSettings(activeSettings);
+        }
+
         const remoteState = data.state as TimerState;
         const remoteMode = data.mode as TimerMode;
+
+        // 不在中完了のチェック
+        if (remoteState === 'running' && data.target_end_at) {
+          const targetEnd = new Date(data.target_end_at).getTime();
+          const now = Date.now();
+          
+          if (now >= targetEnd) {
+            // 不在中にタイマーが終了した
+            const completedMode = remoteMode;
+            
+            // 作業セッションだった場合、統計データに記録
+            if (completedMode === 'work') {
+              await supabase.from('focus_sessions').insert({
+                user_id: userId,
+                duration: activeSettings.workDuration,
+                mode: 'work',
+              });
+              await syncDataFromSupabase(userId);
+            }
+
+            // 次のモード決定
+            let nextMode: TimerMode = 'work';
+            if (completedMode === 'work') {
+              const interval = activeSettings.longBreakInterval || 4;
+              const { count } = await supabase
+                .from('focus_sessions')
+                .select('*', { count: 'exact', head: true })
+                .eq('user_id', userId);
+              
+              const currentCompleted = count || 0;
+              if (currentCompleted > 0 && currentCompleted % interval === 0) {
+                nextMode = 'long';
+              } else {
+                nextMode = 'short';
+              }
+            } else {
+              nextMode = 'work';
+            }
+
+            const isNextWork = nextMode === 'work';
+            const shouldAutoStart = isNextWork ? activeSettings.autoStartWork : activeSettings.autoStartBreak;
+            const nextState = shouldAutoStart ? 'running' : 'stopped';
+
+            let durationMins = activeSettings.workDuration;
+            if (nextMode === 'short') durationMins = activeSettings.shortDuration;
+            if (nextMode === 'long') durationMins = activeSettings.longDuration;
+            const nextSeconds = durationMins * 60;
+
+            setMode(nextMode);
+            setTimerState(nextState);
+            setRemainingSeconds(nextSeconds);
+
+            // 自分が新オーナーとしてDBを更新
+            const updatedSettings = {
+              ...activeSettings,
+              ownerDeviceId: deviceIdRef.current,
+            };
+            setSettings(updatedSettings);
+            await updateDbTimerState(nextState, nextMode, nextSeconds, updatedSettings);
+            return;
+          }
+        }
 
         let remoteRemaining = data.remaining_seconds;
         if (remoteState === 'running' && data.target_end_at) {
@@ -132,13 +225,81 @@ export default function Home() {
   useEffect(() => {
     if (!user) return;
 
-    const handleRemoteTimerSync = (dbTimer: any) => {
+    const handleRemoteTimerSync = async (dbTimer: any) => {
       const localState = timerStateRef.current;
       const localMode = modeRef.current;
       const localRemaining = remainingSecondsRef.current;
+      const localSettings = settingsRef.current;
+
+      // リモートの設定を取得して適用
+      let remoteSettings = localSettings;
+      if (dbTimer.settings) {
+        remoteSettings = {
+          ...DEFAULT_SETTINGS,
+          ...dbTimer.settings,
+        };
+        setSettings(remoteSettings);
+      }
 
       const remoteState = dbTimer.state as TimerState;
       const remoteMode = dbTimer.mode as TimerMode;
+
+      // 不在中完了のチェック (全デバイスが閉じられていた場合のフォールバック)
+      if (remoteState === 'running' && dbTimer.target_end_at) {
+        const targetEnd = new Date(dbTimer.target_end_at).getTime();
+        const now = Date.now();
+        if (now >= targetEnd) {
+          const completedMode = remoteMode;
+          if (completedMode === 'work') {
+            await supabase.from('focus_sessions').insert({
+              user_id: user.id,
+              duration: remoteSettings.workDuration,
+              mode: 'work',
+            });
+            await syncDataFromSupabase(user.id);
+          }
+
+          let nextMode: TimerMode = 'work';
+          if (completedMode === 'work') {
+            const interval = remoteSettings.longBreakInterval || 4;
+            const { count } = await supabase
+              .from('focus_sessions')
+              .select('*', { count: 'exact', head: true })
+              .eq('user_id', user.id);
+            
+            const currentCompleted = count || 0;
+            if (currentCompleted > 0 && currentCompleted % interval === 0) {
+              nextMode = 'long';
+            } else {
+              nextMode = 'short';
+            }
+          } else {
+            nextMode = 'work';
+          }
+
+          const isNextWork = nextMode === 'work';
+          const shouldAutoStart = isNextWork ? remoteSettings.autoStartWork : remoteSettings.autoStartBreak;
+          const nextState = shouldAutoStart ? 'running' : 'stopped';
+
+          let durationMins = remoteSettings.workDuration;
+          if (nextMode === 'short') durationMins = remoteSettings.shortDuration;
+          if (nextMode === 'long') durationMins = remoteSettings.longDuration;
+          const nextSeconds = durationMins * 60;
+
+          setMode(nextMode);
+          setTimerState(nextState);
+          setRemainingSeconds(nextSeconds);
+
+          // 自分が新オーナーとしてDBを更新
+          const updatedSettings = {
+            ...remoteSettings,
+            ownerDeviceId: deviceIdRef.current,
+          };
+          setSettings(updatedSettings);
+          await updateDbTimerState(nextState, nextMode, nextSeconds, updatedSettings);
+          return;
+        }
+      }
 
       let remoteRemaining = dbTimer.remaining_seconds;
       if (remoteState === 'running' && dbTimer.target_end_at) {
@@ -149,8 +310,9 @@ export default function Home() {
       const isStateSame = localState === remoteState;
       const isModeSame = localMode === remoteMode;
       const isTimeClose = Math.abs(localRemaining - remoteRemaining) <= 3;
+      const isSettingsSame = JSON.stringify(localSettings) === JSON.stringify(remoteSettings);
 
-      if (isStateSame && isModeSame && isTimeClose) {
+      if (isStateSame && isModeSame && isTimeClose && isSettingsSame) {
         return; 
       }
 
@@ -183,12 +345,14 @@ export default function Home() {
   }, [user]);
 
   // --- 5. タイマー状態をDBに書き込む処理 ---
-  const updateDbTimerState = async (newState: TimerState, newMode: TimerMode, newRemainingSeconds: number) => {
+  const updateDbTimerState = async (newState: TimerState, newMode: TimerMode, newRemainingSeconds: number, currentSettings?: Settings) => {
     if (!user) return;
     try {
       const targetEndAt = newState === 'running'
         ? new Date(Date.now() + newRemainingSeconds * 1000).toISOString()
         : null;
+
+      const settingsToSave = currentSettings || settingsRef.current;
 
       await supabase.from('user_timers').upsert({
         user_id: user.id,
@@ -196,6 +360,7 @@ export default function Home() {
         mode: newMode,
         remaining_seconds: newRemainingSeconds,
         target_end_at: targetEndAt,
+        settings: settingsToSave,
         updated_at: new Date().toISOString(),
       });
     } catch (err) {
@@ -242,12 +407,14 @@ export default function Home() {
 
   // --- 時間の更新とタイマーの初期設定 ---
   useEffect(() => {
+    let durationMins = settings.workDuration;
+    if (mode === 'short') durationMins = settings.shortDuration;
+    if (mode === 'long') durationMins = settings.longDuration;
+    
+    setTotalDuration(durationMins * 60);
+
+    // タイマー停止中のみ残り時間を最大値に初期化する
     if (timerState === 'stopped') {
-      let durationMins = settings.workDuration;
-      if (mode === 'short') durationMins = settings.shortDuration;
-      if (mode === 'long') durationMins = settings.longDuration;
-      
-      setTotalDuration(durationMins * 60);
       setRemainingSeconds(durationMins * 60);
     }
   }, [mode, settings, timerState]);
@@ -349,13 +516,20 @@ export default function Home() {
 
   // --- タイマー終了時の処理 ---
   const handleTimerExpiry = async () => {
+    // ログイン中かつ自分がオーナーでない（同期）の場合は、DBの書き込み・統計の保存をスキップ
+    const currentIsOwner = !user || (settingsRef.current.ownerDeviceId === deviceIdRef.current);
+
     playNotificationSound(100);
+
+    if (!currentIsOwner) {
+      console.log('非オーナーデバイスのため、タイマー終了のDB更新はスキップします。');
+      return;
+    }
 
     // 次のモード決定
     let nextMode: TimerMode = 'work';
     if (mode === 'work') {
       const interval = settingsRef.current.longBreakInterval || 4;
-      // 今回のセッションを含めて次のモード決定
       const currentCompleted = getFilteredStats().sessionsCompleted + 1;
       if (currentCompleted > 0 && currentCompleted % interval === 0) {
         nextMode = 'long';
@@ -382,7 +556,7 @@ export default function Home() {
     setTimerState(nextState);
     setRemainingSeconds(nextSeconds);
 
-    await updateDbTimerState(nextState, nextMode, nextSeconds);
+    await updateDbTimerState(nextState, nextMode, nextSeconds, settingsRef.current);
 
     // 統計情報の更新 (作業完了時のみ)
     if (mode === 'work') {
@@ -419,21 +593,43 @@ export default function Home() {
         localStorage.setItem('focusflow_sessions', JSON.stringify(nextSessions));
       }
     }
-
-    setTimeout(() => {
-      alert(`${mode === 'work' ? '作業セッション' : '休憩'}が終了しました！`);
-    }, 100);
   };
 
-  // --- 各種操作ハンドラー ---
+  // --- 手動オーナーシップ請求 ---
+  const handleClaimOwnership = async () => {
+    if (!user) return;
+    const updatedSettings = {
+      ...settings,
+      ownerDeviceId: deviceIdRef.current,
+    };
+    setSettings(updatedSettings);
+    localStorage.setItem('focusflow_settings', JSON.stringify(updatedSettings));
+    await updateDbTimerState(timerState, mode, remainingSeconds, updatedSettings);
+  };
+
+  // --- 各種操作ハンドラー (操作した時点で自分がオーナーに昇格する) ---
   const handleStart = async () => {
     setTimerState('running');
-    await updateDbTimerState('running', mode, remainingSeconds);
+    const updatedSettings = {
+      ...settings,
+      ownerDeviceId: user ? deviceIdRef.current : undefined,
+    };
+    if (user) {
+      setSettings(updatedSettings);
+    }
+    await updateDbTimerState('running', mode, remainingSeconds, user ? updatedSettings : undefined);
   };
 
   const handlePause = async () => {
     setTimerState('paused');
-    await updateDbTimerState('paused', mode, remainingSeconds);
+    const updatedSettings = {
+      ...settings,
+      ownerDeviceId: user ? deviceIdRef.current : undefined,
+    };
+    if (user) {
+      setSettings(updatedSettings);
+    }
+    await updateDbTimerState('paused', mode, remainingSeconds, user ? updatedSettings : undefined);
   };
 
   const handleReset = async () => {
@@ -444,48 +640,125 @@ export default function Home() {
     const durationSecs = durationMins * 60;
     
     setRemainingSeconds(durationSecs);
-    await updateDbTimerState('stopped', mode, durationSecs);
+    const updatedSettings = {
+      ...settings,
+      ownerDeviceId: user ? deviceIdRef.current : undefined,
+    };
+    if (user) {
+      setSettings(updatedSettings);
+    }
+    await updateDbTimerState('stopped', mode, durationSecs, user ? updatedSettings : undefined);
   };
 
   const handleSkip = () => {
-    if (confirm('現在のセッションをスキップして、次のセッションに進みますか？')) {
-      handleTimerExpiry();
+    // confirm は廃止のため、即座にスキップ実行
+    // スキップした時点で自分がオーナーとなる
+    const updatedSettings = {
+      ...settings,
+      ownerDeviceId: user ? deviceIdRef.current : undefined,
+    };
+    if (user) {
+      setSettings(updatedSettings);
     }
+    handleTimerExpiry();
   };
 
   // 設定の保存
-  const handleSaveSettings = (newSettings: Settings) => {
-    setSettings(newSettings);
-    localStorage.setItem('focusflow_settings', JSON.stringify(newSettings));
-  };
+  const handleSaveSettings = async (newSettings: Settings) => {
+    const updatedSettings = {
+      ...newSettings,
+      ownerDeviceId: user ? (settings.ownerDeviceId || deviceIdRef.current) : undefined,
+    };
+    setSettings(updatedSettings);
+    localStorage.setItem('focusflow_settings', JSON.stringify(updatedSettings));
 
-  // 統計リセット
-  const handleResetStats = async () => {
-    if (confirm('すべての今日のフォーカス統計データをリセットしますか？この操作は取り消せません。')) {
-      if (user) {
-        try {
-          const { error } = await supabase.from('focus_sessions').delete().eq('user_id', user.id);
-          if (error) throw error;
-          setFocusSessions([]);
-          alert('統計データをリセットしました。');
-        } catch (err) {
-          console.error('統計データリセットエラー:', err);
-        }
-      } else {
-        setFocusSessions([]);
-        localStorage.setItem('focusflow_sessions', JSON.stringify([]));
-        alert('統計データをリセットしました。');
-      }
+    if (user) {
+      await updateDbTimerState(timerState, mode, remainingSeconds, updatedSettings);
     }
   };
 
-  // ログアウト処理
-  const handleLogout = async () => {
-    if (confirm('ログアウトしますか？')) {
-      const { error } = await supabase.auth.signOut();
-      if (error) console.error('ログアウトエラー:', error);
+  // 統計リセット (confirm 廃止のため、即座にリセット実行)
+  const handleResetStats = async () => {
+    if (user) {
+      try {
+        const { error } = await supabase.from('focus_sessions').delete().eq('user_id', user.id);
+        if (error) throw error;
+        setFocusSessions([]);
+      } catch (err) {
+        console.error('統計データリセットエラー:', err);
+      }
+    } else {
       setFocusSessions([]);
-      setTimerState('stopped');
+      localStorage.setItem('focusflow_sessions', JSON.stringify([]));
+    }
+  };
+
+  // ログアウト処理 (confirm 廃止のため、即座にログアウト実行)
+  const handleLogout = async () => {
+    const { error } = await supabase.auth.signOut();
+    if (error) console.error('ログアウトエラー:', error);
+    setFocusSessions([]);
+    setTimerState('stopped');
+  };
+
+  // テスト用ダミーセッションデータの生成
+  const handleGenerateTestData = async () => {
+    const dates = [];
+    const now = new Date();
+    for (let i = 0; i < 7; i++) {
+      const d = new Date();
+      d.setDate(now.getDate() - i);
+      dates.push(d);
+    }
+
+    const dummySessions = [];
+    for (const d of dates) {
+      // 1日に1〜3セッションを生成
+      const count = Math.floor(Math.random() * 3) + 1;
+      for (let j = 0; j < count; j++) {
+        const hour = 9 + Math.floor(Math.random() * 10);
+        const min = Math.floor(Math.random() * 60);
+        const sessionDate = new Date(d);
+        sessionDate.setHours(hour, min, 0, 0);
+
+        dummySessions.push({
+          duration: [25, 50, 15][Math.floor(Math.random() * 3)],
+          mode: 'work',
+          completedAt: sessionDate.toISOString(),
+        });
+      }
+    }
+
+    if (user) {
+      try {
+        const rows = dummySessions.map(s => ({
+          user_id: user.id,
+          duration: s.duration,
+          mode: s.mode,
+          completed_at: s.completedAt,
+        }));
+        const { error } = await supabase.from('focus_sessions').insert(rows);
+        if (error) throw error;
+        await syncDataFromSupabase(user.id);
+        console.log('過去7日間のダミー統計データを同期生成しました！');
+      } catch (err) {
+        console.error('ダミーセッション生成エラー:', err);
+      }
+    } else {
+      const savedSessions = localStorage.getItem('focusflow_sessions');
+      const current = savedSessions ? JSON.parse(savedSessions) : [];
+      const newSessions = [
+        ...current,
+        ...dummySessions.map((s, idx) => ({
+          id: 'dummy_' + Date.now() + '_' + idx,
+          duration: s.duration,
+          mode: s.mode,
+          completedAt: s.completedAt,
+        }))
+      ];
+      setFocusSessions(newSessions);
+      localStorage.setItem('focusflow_sessions', JSON.stringify(newSessions));
+      console.log('過去7日間のダミー統計データをローカル生成しました！');
     }
   };
 
@@ -523,6 +796,27 @@ export default function Home() {
         
         {/* クラウド同期・認証コントロール */}
         <div className="flex items-center gap-2 sm:gap-4 shrink-0">
+          {user && (
+            <div className="flex items-center gap-2 bg-white/[0.03] border border-glass-border px-3 py-2 rounded-xl text-xs select-none">
+              {isOwner ? (
+                <div className="flex items-center gap-1.5 text-green-400 font-semibold">
+                  <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+                  <span>メイン操作中</span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <span className="text-text-secondary">同期中 (サブ)</span>
+                  <button
+                    onClick={handleClaimOwnership}
+                    className="text-theme hover:underline border-none bg-transparent cursor-pointer font-semibold"
+                  >
+                    メインにする
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           {user ? (
             <div className="flex items-center gap-2 bg-white/[0.03] border border-glass-border px-3 py-2 rounded-xl text-xs text-text-secondary select-none">
               <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" title="クラウド同期中" />
@@ -597,7 +891,7 @@ export default function Home() {
         <p>Pomodoro Timer Δ &copy; 2026 - Antigravity 開発サンプル</p>
       </footer>
 
-      {/* 設定モーダル */}
+       {/* 設定モーダル */}
       <SettingsModal
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
@@ -605,6 +899,7 @@ export default function Home() {
         onSaveSettings={handleSaveSettings}
         onResetStats={handleResetStats}
         onPlayTestSound={playNotificationSound}
+        onGenerateTestData={handleGenerateTestData}
       />
 
       {/* 認証モーダル */}

@@ -10,6 +10,7 @@ export interface Settings {
   autoStartWork: boolean; // 次の作業を自動スタート
   autoStartBreak: boolean; // 次の休憩を自動スタート
   muteNotification: boolean; // 通知音をミュート
+  ownerDeviceId?: string; // オーナーデバイスID (複数デバイス間の競合防止用)
 }
 
 export interface Stats {
